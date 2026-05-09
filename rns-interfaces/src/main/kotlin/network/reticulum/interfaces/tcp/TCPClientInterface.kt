@@ -52,6 +52,19 @@ class TCPClientInterface(
      * When provided, creates child scope that cancels when parent cancels - for Android service usage.
      */
     private val parentScope: CoroutineScope? = null,
+    /**
+     * Optional dialer used in place of the default `Socket()` + `connect()`
+     * pair. Lets callers route the underlying TCP through a userspace
+     * tunnel (WireGuard / Tailscale) or a SOCKS5/HTTP proxy without this
+     * class needing to know about either. Receives `(host, port,
+     * timeoutMs)` and must return a connected `java.net.Socket`. When
+     * null (default) the interface dials directly through the kernel.
+     *
+     * Socket-level options (`tcpNoDelay`, `keepAlive`, `soTimeout`,
+     * `soLinger`) are still applied after dial; userspace-tunnel sockets
+     * generally accept-and-ignore them.
+     */
+    private val socketDialer: ((String, Int, Int) -> java.net.Socket)? = null,
 ) : Interface(name) {
 
     companion object {
@@ -181,8 +194,10 @@ class TCPClientInterface(
                 log("Establishing TCP connection to $targetHost:$targetPort...")
             }
 
-            val sock = Socket()
-            sock.connect(InetSocketAddress(targetHost, targetPort), connectTimeoutMs)
+            val sock = socketDialer?.invoke(targetHost, targetPort, connectTimeoutMs)
+                ?: Socket().also {
+                    it.connect(InetSocketAddress(targetHost, targetPort), connectTimeoutMs)
+                }
             sock.tcpNoDelay = true
             sock.keepAlive = keepAlive
             sock.soTimeout = 0 // Block on read
