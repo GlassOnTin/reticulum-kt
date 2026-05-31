@@ -220,6 +220,9 @@ class Channel(
      * @throws ChannelException if channel is not ready or message is too big
      */
     fun send(message: MessageBase): Envelope {
+        // Prepare the envelope under the channel lock (sequence, TX ring, pack).
+        val envelope: Envelope
+        val raw: ByteArray
         lock.withLock {
             if (!isReadyToSend()) {
                 throw ChannelException(
@@ -230,29 +233,40 @@ class Channel(
 
             // Create envelope with next sequence number
             val sequence = nextSequence.getAndUpdate { (it + 1) % SEQ_MODULUS }
-            val envelope = Envelope(outlet, message, sequence = sequence)
+            envelope = Envelope(outlet, message, sequence = sequence)
 
-            // Add to TX ring
+            // Add to TX ring (packet still null — packetTxOp skips null-packet
+            // envelopes, so an in-flight proof can't match it before block 2).
             emplaceEnvelope(envelope, txRing)
 
             // Pack the message
             envelope.pack()
 
             // Check size
-            val raw = envelope.raw!!
+            raw = envelope.raw!!
             if (raw.size > outlet.mdu) {
                 throw ChannelException(
                     ChannelExceptionType.ME_INVALID_MSG_TYPE,
                     "Packed message too big for packet: ${raw.size} > ${outlet.mdu}"
                 )
             }
+        }
 
-            // Send via outlet
-            val packet = outlet.send(raw)
+        // Send via the outlet WITHOUT holding the channel lock. outlet.send
+        // descends into Transport.outbound, which takes Transport.jobsLock —
+        // and the inbound/ACK path takes jobsLock then this channel lock
+        // (Channel.packetTxOp). Holding the channel lock across outlet.send
+        // therefore deadlocks under concurrent send + ACK (burst sends:
+        // file upload, port forward). The unlocked window here is microseconds,
+        // far shorter than any proof round-trip, so no proof can arrive before
+        // block 2 registers the delivery callback.
+        val packet = outlet.send(raw)
+
+        // Record the packet and wire callbacks under the lock again.
+        lock.withLock {
             envelope.packet = packet
             envelope.tries++
 
-            // Set up callbacks if packet was sent
             if (packet != null) {
                 outlet.setPacketDeliveredCallback(packet) { pkt ->
                     packetDelivered(pkt)
@@ -265,9 +279,9 @@ class Channel(
             }
 
             updatePacketTimeouts()
-
-            return envelope
         }
+
+        return envelope
     }
 
     /**
