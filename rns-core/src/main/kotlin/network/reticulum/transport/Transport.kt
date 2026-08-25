@@ -2816,27 +2816,18 @@ object Transport {
         // Check if we have a known path
         val pathEntry = pathTable[packet.destinationHash.toKey()]
 
-        // Use path routing when we have a valid, unexpired path.
-        // For DATA packets with multi-hop paths, we still broadcast since HEADER_2 transport
-        // routing has issues with nextHop. But for 1-hop (direct) paths, we use path routing
-        // to avoid duplicate sends across multiple interfaces.
-        val usePathRouting =
-            pathEntry != null &&
-                !pathEntry.isExpired() &&
-                packet.packetType != PacketType.ANNOUNCE &&
-                packet.destinationType != DestinationType.PLAIN &&
-                packet.destinationType != DestinationType.GROUP
+        // How the packet leaves is a pure decision over the path entry; see
+        // [OutboundRoute] for why a link is never routed.
+        val route =
+            OutboundRoute.choose(
+                destinationType = packet.destinationType,
+                packetType = packet.packetType,
+                hasUsablePath = pathEntry != null && !pathEntry.isExpired(),
+                pathHops = pathEntry?.hops ?: 0,
+                behindSharedInstance = isConnectedToSharedInstance,
+            )
 
-        // For DATA packets, only use path routing for direct (1-hop) connections
-        // Multi-hop DATA packets still need broadcasting until transport routing is fixed
-        val effectiveUsePathRouting =
-            if (packet.packetType == PacketType.DATA && pathEntry != null) {
-                usePathRouting && pathEntry.hops == 1
-            } else {
-                usePathRouting
-            }
-
-        if (effectiveUsePathRouting) {
+        if (route != OutboundRoute.Choice.ATTACHED_OR_BROADCAST) {
             // We have a path - use it
             val outboundInterface = findInterfaceByHash(pathEntry!!.receivingInterfaceHash)
             if (outboundInterface == null) {
@@ -2850,23 +2841,15 @@ object Transport {
             }
             if (outboundInterface != null) {
                 log("Sending to $destHex via path (${pathEntry.hops} hops) on ${outboundInterface.name}")
-                if (pathEntry.hops > 1) {
+                if (route == OutboundRoute.Choice.PATH_TRANSPORT) {
                     // Insert into transport (HEADER_2)
                     val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
                     transmit(outboundInterface, transportRaw)
-                    sent = true
-                } else if (pathEntry.hops == 1 && isConnectedToSharedInstance) {
-                    // When behind a shared instance, even 1-hop destinations need
-                    // transport headers so the shared instance can route them onto
-                    // the network. Python Transport.py:993-1011
-                    val transportRaw = insertIntoTransport(packet, pathEntry.nextHop)
-                    transmit(outboundInterface, transportRaw)
-                    sent = true
                 } else {
                     // Direct transmission
                     transmit(outboundInterface, packedData)
-                    sent = true
                 }
+                sent = true
 
                 // Update path timestamp
                 val touched = pathEntry.touch()
