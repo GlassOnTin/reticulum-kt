@@ -1209,11 +1209,35 @@ class Resource private constructor(
 
     /**
      * Cancel this resource transfer.
+     *
+     * Idempotency + atomicity, mirroring python `Resource.py:1090`'s
+     * `elif self.status < Resource.COMPLETE:` guard (upstream reticulum-kt
+     * 400397a5): once a resource has reached a terminal state
+     * (COMPLETE / FAILED, status >= COMPLETE = 0x06) a second cancel() is a
+     * no-op — remote peers drive cancel() from RESOURCE_ICL / RESOURCE_RCL
+     * while our own watchdog can time out concurrently, so without the guard
+     * both paths conclude the resource twice. The terminal status is published
+     * under the same monitor startWatchdog() uses (status-then-stop, like
+     * python), which closes the stop-then-status gap where another thread
+     * could otherwise install a fresh watchdog on a cancelled Resource.
      */
     fun cancel() {
-        stopWatchdog()
-        status = ResourceConstants.FAILED
+        val transitionedToFailed = synchronized(this) {
+            if (status >= ResourceConstants.COMPLETE) {
+                false
+            } else {
+                status = ResourceConstants.FAILED
+                stopWatchdog()
+                true
+            }
+        }
+        if (!transitionedToFailed) return
         link.resourceConcluded(this)
+        // Fire failed exactly once on the transition (upstream 400397a5): the
+        // watchdog timeout path used to invoke it inline, so cancel() must too
+        // — the guard above is what keeps a concurrent peer ICL/RCL from
+        // delivering it a second time.
+        callbacks.failed?.invoke(this)
         log("Resource ${hash.toHexString()} cancelled")
     }
 
@@ -1283,19 +1307,34 @@ class Resource private constructor(
 
     /**
      * Start watchdog thread for timeout detection.
+     *
+     * Synchronised with cancel() and the ASSEMBLING guard mirror upstream
+     * reticulum-kt afd646a7: a terminal status must never get a fresh
+     * watchdog installed on it, and the check must be atomic with setting
+     * watchdogActive so a concurrent cancel() can't slip between the guard
+     * and the flag.
      */
+    @Synchronized
     private fun startWatchdog() {
         if (watchdogActive) return
+        if (status >= ResourceConstants.ASSEMBLING) return
 
         watchdogActive = true
-        watchdogThread = thread(name = "resource-watchdog-${hash.toHexString().take(8)}") {
+        val newThread = thread(
+            start = false,
+            isDaemon = true,
+            name = "resource-watchdog-${hash.toHexString().take(8)}",
+        ) {
             watchdogJob()
         }
+        watchdogThread = newThread
+        newThread.start()
     }
 
     /**
      * Stop the watchdog thread.
      */
+    @Synchronized
     private fun stopWatchdog() {
         watchdogActive = false
         watchdogThread?.interrupt()
@@ -1306,38 +1345,47 @@ class Resource private constructor(
      * Watchdog job for timeout handling.
      */
     private fun watchdogJob() {
-        while (watchdogActive) {
-            try {
-                Thread.sleep(ResourceConstants.WATCHDOG_MAX_SLEEP * 1000)
+        try {
+            while (watchdogActive && status < ResourceConstants.ASSEMBLING) {
+                try {
+                    Thread.sleep(ResourceConstants.WATCHDOG_MAX_SLEEP * 1000)
 
-                if (!watchdogActive) break
+                    if (!watchdogActive || status >= ResourceConstants.ASSEMBLING) break
 
-                val now = System.currentTimeMillis()
-                val idleTime = now - lastActivity
+                    val now = System.currentTimeMillis()
+                    val idleTime = now - lastActivity
 
-                // Check for timeout
-                val timeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
-                if (idleTime > timeout) {
-                    retries++
-                    if (retries > ResourceConstants.MAX_RETRIES) {
-                        status = ResourceConstants.FAILED
-                        log("Resource ${hash.toHexString()} timed out after $retries retries")
-                        callbacks.failed?.invoke(this)
-                        watchdogActive = false
-                        break
-                    } else {
-                        log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")
-                        if (!initiator) {
-                            requestNext()
+                    // Check for timeout
+                    val timeout = (link.rtt ?: 5000L) * ResourceConstants.PART_TIMEOUT_FACTOR
+                    if (idleTime > timeout) {
+                        retries++
+                        if (retries > ResourceConstants.MAX_RETRIES) {
+                            // Mirrors python Resource.py — every retries-exhausted
+                            // branch calls cancel(). Going through cancel() (rather
+                            // than the previous inline status+failed-callback) runs
+                            // link.resourceConcluded(this), which removes the
+                            // resource from the link registries, and fires the
+                            // failed callback exactly once even if a peer ICL/RCL
+                            // cancels it concurrently.
+                            log("Resource ${hash.toHexString()} timed out after $retries retries")
+                            cancel()
+                            break
+                        } else {
+                            log("Resource timeout, retry $retries/${ResourceConstants.MAX_RETRIES}")
+                            if (!initiator) {
+                                requestNext()
+                            }
                         }
                     }
-                }
 
-            } catch (e: InterruptedException) {
-                break
-            } catch (e: Exception) {
-                log("Watchdog error: ${e.message}")
+                } catch (e: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    log("Watchdog error: ${e.message}")
+                }
             }
+        } finally {
+            watchdogActive = false
         }
     }
 
