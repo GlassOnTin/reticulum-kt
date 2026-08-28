@@ -259,6 +259,12 @@ class Resource private constructor(
     private var watchdogThread: Thread? = null
     @Volatile private var watchdogActive = false
 
+    // Test seam (mirrors upstream reticulum-kt): invoked inside cancel()'s
+    // monitor between publishing FAILED and stopping the watchdog, so a test
+    // can hold the monitor and observe a concurrent startWatchdog() block on
+    // it. Null in production; never set outside tests.
+    @Volatile private var cancelTransitionHookForTest: (() -> Unit)? = null
+
     // SDU for this resource — uses plain packet MDU (not link MDU) because
     // resource parts are already bulk-encrypted before splitting, and are sent
     // as raw packets that only add header + IFAC overhead (no Token encryption).
@@ -1227,6 +1233,7 @@ class Resource private constructor(
                 false
             } else {
                 status = ResourceConstants.FAILED
+                cancelTransitionHookForTest?.invoke()
                 stopWatchdog()
                 true
             }
@@ -1387,6 +1394,21 @@ class Resource private constructor(
         } finally {
             watchdogActive = false
         }
+    }
+
+    // ===== Test seams (mirrors upstream reticulum-kt LinkResourceDedupTest) =====
+    // Thin public wrappers over private watchdog state so the race regression
+    // test can drive and observe it. None changes protocol behaviour.
+
+    /** private watchdogActive flag. */
+    fun watchdogActiveForTest(): Boolean = watchdogActive
+
+    /** Explicit watchdog start, bypassing the internal call sites. */
+    fun startWatchdogForTest() = startWatchdog()
+
+    /** Install a hook fired inside cancel()'s monitor (null to clear). */
+    fun setCancelTransitionHookForTest(hook: (() -> Unit)?) {
+        cancelTransitionHookForTest = hook
     }
 
     override fun toString(): String {
